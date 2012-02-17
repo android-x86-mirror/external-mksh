@@ -2,7 +2,8 @@
 /*	$OpenBSD: trap.c,v 1.23 2010/05/19 17:36:08 jasper Exp $	*/
 
 /*-
- * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010
+ * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
+ *		 2011, 2012
  *	Thorsten Glaser <tg@mirbsd.org>
  *
  * Provided that these terms and disclaimer and all copyright notices
@@ -22,96 +23,123 @@
  */
 
 #include "sh.h"
-#if HAVE_PERSISTENT_HISTORY
+#if HAVE_SYS_FILE_H
 #include <sys/file.h>
 #endif
 
-__RCSID("$MirOS: src/bin/mksh/histrap.c,v 1.98 2010/07/24 17:08:29 tg Exp $");
-
-/*-
- * MirOS: This is the default mapping type, and need not be specified.
- * IRIX doesn't have this constant.
- */
-#ifndef MAP_FILE
-#define MAP_FILE	0
-#endif
+__RCSID("$MirOS: src/bin/mksh/histrap.c,v 1.123 2012/04/14 16:07:47 tg Exp $");
 
 Trap sigtraps[NSIG + 1];
 static struct sigaction Sigact_ign;
 
 #if HAVE_PERSISTENT_HISTORY
-static int hist_count_lines(unsigned char *, int);
-static int hist_shrink(unsigned char *, int);
-static unsigned char *hist_skip_back(unsigned char *,int *,int);
-static void histload(Source *, unsigned char *, int);
-static void histinsert(Source *, int, const char *);
-static void writehistfile(int, char *);
-static int sprinkle(int);
+static int histload(Source *, unsigned char *, size_t);
+static int writehistline(int, int, const char *);
+static void writehistfile(int, const char *);
 #endif
 
 static int hist_execute(char *);
-static int hist_replace(char **, const char *, const char *, bool);
 static char **hist_get(const char *, bool, bool);
 static char **hist_get_oldest(void);
-static void histbackup(void);
 
-static char **current;		/* current position in history[] */
-static int hstarted;		/* set after hist_init() called */
+static bool hstarted;		/* set after hist_init() called */
 static Source *hist_source;
 
 #if HAVE_PERSISTENT_HISTORY
-static char *hname;		/* current name of history file */
-static int histfd;
-static int hsize;
+/*XXX imake style */
+#if defined(__linux)
+#define caddr_cast(x)	((void *)(x))
+#else
+#define caddr_cast(x)	((caddr_t)(x))
 #endif
+
+/* several OEs do not have these constants */
+#ifndef MAP_FAILED
+#define MAP_FAILED	caddr_cast(-1)
+#endif
+
+/* some OEs need the default mapping type specified */
+#ifndef MAP_FILE
+#define MAP_FILE	0
+#endif
+
+/* current history file: name, fd, size */
+static char *hname;
+static int histfd = -1;
+static off_t histfsize;
+#endif
+
+static const char Tnot_in_history[] = "not in history";
+#define Thistory (Tnot_in_history + 7)
+
+static const char TFCEDIT_dollaru[] = "${FCEDIT:-/bin/ed} $_";
+#define Tspdollaru (TFCEDIT_dollaru + 18)
+
+/* HISTSIZE default: size of saved history, persistent or standard */
+#ifdef MKSH_SMALL
+#define MKSH_DEFHISTSIZE	255
+#else
+#define MKSH_DEFHISTSIZE	2047
+#endif
+/* maximum considered size of persistent history file */
+#define MKSH_MAXHISTFSIZE	((off_t)1048576 * 96)
 
 int
 c_fc(const char **wp)
 {
 	struct shf *shf;
 	struct temp *tf;
-	const char *p;
-	char *editor = NULL;
 	bool gflag = false, lflag = false, nflag = false, rflag = false,
 	    sflag = false;
 	int optc;
-	const char *first = NULL, *last = NULL;
-	char **hfirst, **hlast, **hp;
+	const char *p, *first = NULL, *last = NULL;
+	char **hfirst, **hlast, **hp, *editor = NULL;
 
 	if (!Flag(FTALKING_I)) {
-		bi_errorf("history functions not available");
+		bi_errorf("history %ss not available", Tfunction);
 		return (1);
 	}
 
 	while ((optc = ksh_getopt(wp, &builtin_opt,
 	    "e:glnrs0,1,2,3,4,5,6,7,8,9,")) != -1)
 		switch (optc) {
+
 		case 'e':
 			p = builtin_opt.optarg;
 			if (ksh_isdash(p))
 				sflag = true;
 			else {
 				size_t len = strlen(p);
+
+				/* almost certainly not overflowing */
 				editor = alloc(len + 4, ATEMP);
 				memcpy(editor, p, len);
-				memcpy(editor + len, " $_", 4);
+				memcpy(editor + len, Tspdollaru, 4);
 			}
 			break;
-		case 'g': /* non-AT&T ksh */
+
+		/* non-AT&T ksh */
+		case 'g':
 			gflag = true;
 			break;
+
 		case 'l':
 			lflag = true;
 			break;
+
 		case 'n':
 			nflag = true;
 			break;
+
 		case 'r':
 			rflag = true;
 			break;
-		case 's':	/* POSIX version of -e - */
+
+		/* POSIX version of -e - */
+		case 's':
 			sflag = true;
 			break;
+
 		/* kludge city - accept -num as -- -num (kind of) */
 		case '0': case '1': case '2': case '3': case '4':
 		case '5': case '6': case '7': case '8': case '9':
@@ -126,6 +154,7 @@ c_fc(const char **wp)
 				return (1);
 			}
 			break;
+
 		case '?':
 			return (1);
 		}
@@ -133,7 +162,7 @@ c_fc(const char **wp)
 
 	/* Substitute and execute command */
 	if (sflag) {
-		char *pat = NULL, *rep = NULL;
+		char *pat = NULL, *rep = NULL, *line;
 
 		if (editor || lflag || nflag || rflag) {
 			bi_errorf("can't use -e, -l, -n, -r with -s (-e -)");
@@ -159,7 +188,42 @@ c_fc(const char **wp)
 		    hist_get_newest(false);
 		if (!hp)
 			return (1);
-		return (hist_replace(hp, pat, rep, gflag));
+		/* hist_replace */
+		if (!pat)
+			strdupx(line, *hp, ATEMP);
+		else {
+			char *s, *s1;
+			size_t len, pat_len, rep_len;
+			XString xs;
+			char *xp;
+			bool any_subst = false;
+
+			pat_len = strlen(pat);
+			rep_len = strlen(rep);
+			Xinit(xs, xp, 128, ATEMP);
+			for (s = *hp; (s1 = strstr(s, pat)) &&
+			    (!any_subst || gflag); s = s1 + pat_len) {
+				any_subst = true;
+				len = s1 - s;
+				XcheckN(xs, xp, len + rep_len);
+				/*; first part */
+				memcpy(xp, s, len);
+				xp += len;
+				/* replacement */
+				memcpy(xp, rep, rep_len);
+				xp += rep_len;
+			}
+			if (!any_subst) {
+				bi_errorf("bad substitution");
+				return (1);
+			}
+			len = strlen(s) + 1;
+			XcheckN(xs, xp, len);
+			memcpy(xp, s, len);
+			xp += len;
+			line = Xclose(xs, xp);
+		}
+		return (hist_execute(line));
 	}
 
 	if (editor && (lflag || nflag)) {
@@ -183,11 +247,12 @@ c_fc(const char **wp)
 		/* can't fail if hfirst didn't fail */
 		hlast = hist_get_newest(false);
 	} else {
-		/* POSIX says not an error if first/last out of bounds
-		 * when range is specified; AT&T ksh and pdksh allow out of
-		 * bounds for -l as well.
+		/*
+		 * POSIX says not an error if first/last out of bounds
+		 * when range is specified; AT&T ksh and pdksh allow out
+		 * of bounds for -l as well.
 		 */
-		hfirst = hist_get(first, (lflag || last) ? true : false, lflag);
+		hfirst = hist_get(first, tobool(lflag || last), lflag);
 		if (!hfirst)
 			return (1);
 		hlast = last ? hist_get(last, true, lflag) :
@@ -199,7 +264,8 @@ c_fc(const char **wp)
 		char **temp;
 
 		temp = hfirst; hfirst = hlast; hlast = temp;
-		rflag = !rflag; /* POSIX */
+		/* POSIX */
+		rflag = !rflag;
 	}
 
 	/* List history */
@@ -230,27 +296,28 @@ c_fc(const char **wp)
 
 	tf = maketemp(ATEMP, TT_HIST_EDIT, &e->temps);
 	if (!(shf = tf->shf)) {
-		bi_errorf("cannot create temp file %s - %s",
-		    tf->name, strerror(errno));
+		bi_errorf("can't %s temporary file %s: %s",
+		    "create", tf->tffn, strerror(errno));
 		return (1);
 	}
 	for (hp = rflag ? hlast : hfirst;
 	    hp >= hfirst && hp <= hlast; hp += rflag ? -1 : 1)
 		shf_fprintf(shf, "%s\n", *hp);
 	if (shf_close(shf) == EOF) {
-		bi_errorf("error writing temporary file - %s", strerror(errno));
+		bi_errorf("can't %s temporary file %s: %s",
+		    "write", tf->tffn, strerror(errno));
 		return (1);
 	}
 
 	/* Ignore setstr errors here (arbitrary) */
-	setstr(local("_", false), tf->name, KSH_RETURN_ERROR);
+	setstr(local("_", false), tf->tffn, KSH_RETURN_ERROR);
 
 	/* XXX: source should not get trashed by this.. */
 	{
 		Source *sold = source;
 		int ret;
 
-		ret = command(editor ? editor : "${FCEDIT:-/bin/ed} $_", 0);
+		ret = command(editor ? editor : TFCEDIT_dollaru, 0);
 		source = sold;
 		if (ret)
 			return (ret);
@@ -260,14 +327,22 @@ c_fc(const char **wp)
 		struct stat statb;
 		XString xs;
 		char *xp;
-		int n;
+		ssize_t n;
 
-		if (!(shf = shf_open(tf->name, O_RDONLY, 0, 0))) {
-			bi_errorf("cannot open temp file %s", tf->name);
+		if (!(shf = shf_open(tf->tffn, O_RDONLY, 0, 0))) {
+			bi_errorf("can't %s temporary file %s: %s",
+			    "open", tf->tffn, strerror(errno));
 			return (1);
 		}
 
-		n = stat(tf->name, &statb) < 0 ? 128 : statb.st_size + 1;
+		if (stat(tf->tffn, &statb) < 0)
+			n = 128;
+		else if ((off_t)statb.st_size > MKSH_MAXHISTFSIZE) {
+			bi_errorf("%s %s too large: %lu", Thistory,
+			    "file", (unsigned long)statb.st_size);
+			goto errout;
+		} else
+			n = (size_t)statb.st_size + 1;
 		Xinit(xs, xp, n, hist_source->areap);
 		while ((n = shf_read(xp, Xnleft(xs, xp), shf)) > 0) {
 			xp += n;
@@ -275,8 +350,9 @@ c_fc(const char **wp)
 				XcheckN(xs, xp, Xlength(xs, xp));
 		}
 		if (n < 0) {
-			bi_errorf("error reading temp file %s - %s",
-			    tf->name, strerror(shf_errno(shf)));
+			bi_errorf("can't %s temporary file %s: %s",
+			    "read", tf->tffn, strerror(shf_errno(shf)));
+ errout:
 			shf_close(shf);
 			return (1);
 		}
@@ -291,26 +367,37 @@ c_fc(const char **wp)
 static int
 hist_execute(char *cmd)
 {
+	static int last_line = -1;
 	Source *sold;
 	int ret;
 	char *p, *q;
 
-	histbackup();
+	/* Back up over last histsave */
+	if (histptr >= history && last_line != hist_source->line) {
+		hist_source->line--;
+		afree(*histptr, APERM);
+		histptr--;
+		last_line = hist_source->line;
+	}
 
 	for (p = cmd; p; p = q) {
 		if ((q = strchr(p, '\n'))) {
-			*q++ = '\0'; /* kill the newline */
-			if (!*q) /* ignore trailing newline */
+			/* kill the newline */
+			*q++ = '\0';
+			if (!*q)
+				/* ignore trailing newline */
 				q = NULL;
 		}
 		histsave(&hist_source->line, p, true, true);
 
-		shellf("%s\n", p); /* POSIX doesn't say this is done... */
-		if (q)		/* restore \n (trailing \n not restored) */
+		/* POSIX doesn't say this is done... */
+		shellf("%s\n", p);
+		if (q)
+			/* restore \n (trailing \n not restored) */
 			q[-1] = '\n';
 	}
 
-	/*
+	/*-
 	 * Commands are executed here instead of pushing them onto the
 	 * input 'cause POSIX says the redirection and variable assignments
 	 * in
@@ -322,46 +409,6 @@ hist_execute(char *cmd)
 	ret = command(cmd, 0);
 	source = sold;
 	return (ret);
-}
-
-static int
-hist_replace(char **hp, const char *pat, const char *rep, bool globr)
-{
-	char *line;
-
-	if (!pat)
-		strdupx(line, *hp, ATEMP);
-	else {
-		char *s, *s1;
-		int pat_len = strlen(pat);
-		int rep_len = strlen(rep);
-		int len;
-		XString xs;
-		char *xp;
-		bool any_subst = false;
-
-		Xinit(xs, xp, 128, ATEMP);
-		for (s = *hp; (s1 = strstr(s, pat)) && (!any_subst || globr);
-		    s = s1 + pat_len) {
-			any_subst = true;
-			len = s1 - s;
-			XcheckN(xs, xp, len + rep_len);
-			memcpy(xp, s, len);		/* first part */
-			xp += len;
-			memcpy(xp, rep, rep_len);	/* replacement */
-			xp += rep_len;
-		}
-		if (!any_subst) {
-			bi_errorf("substitution failed");
-			return (1);
-		}
-		len = strlen(s) + 1;
-		XcheckN(xs, xp, len);
-		memcpy(xp, s, len);
-		xp += len;
-		line = Xclose(xs, xp);
-	}
-	return (hist_execute(line));
 }
 
 /*
@@ -380,18 +427,18 @@ hist_get(const char *str, bool approx, bool allow_cur)
 			if (approx)
 				hp = hist_get_oldest();
 			else {
-				bi_errorf("%s: not in history", str);
+				bi_errorf("%s: %s", str, Tnot_in_history);
 				hp = NULL;
 			}
 		} else if ((ptrdiff_t)hp > (ptrdiff_t)histptr) {
 			if (approx)
 				hp = hist_get_newest(allow_cur);
 			else {
-				bi_errorf("%s: not in history", str);
+				bi_errorf("%s: %s", str, Tnot_in_history);
 				hp = NULL;
 			}
 		} else if (!allow_cur && hp == histptr) {
-			bi_errorf("%s: invalid range", str);
+			bi_errorf("%s: %s", str, "invalid range");
 			hp = NULL;
 		}
 	} else {
@@ -399,7 +446,7 @@ hist_get(const char *str, bool approx, bool allow_cur)
 
 		/* the -1 is to avoid the current fc command */
 		if ((n = findhist(histptr - history - 1, 0, str, anchored)) < 0)
-			bi_errorf("%s: not in history", str);
+			bi_errorf("%s: %s", str, Tnot_in_history);
 		else
 			hp = &history[n];
 	}
@@ -428,21 +475,9 @@ hist_get_oldest(void)
 	return (history);
 }
 
-/******************************/
-/* Back up over last histsave */
-/******************************/
-static void
-histbackup(void)
-{
-	static int last_line = -1;
-
-	if (histptr >= history && last_line != hist_source->line) {
-		hist_source->line--;
-		afree(*histptr, APERM);
-		histptr--;
-		last_line = hist_source->line;
-	}
-}
+#if !MKSH_S_NOVI
+/* current position in history[] */
+static char **current;
 
 /*
  * Return the current position.
@@ -466,6 +501,7 @@ histnum(int n)
 		return (n);
 	}
 }
+#endif
 
 /*
  * This will become unnecessary if hist_get is modified to allow
@@ -475,10 +511,10 @@ histnum(int n)
 int
 findhist(int start, int fwd, const char *str, int anchored)
 {
-	char	**hp;
-	int	maxhist = histptr - history;
-	int	incr = fwd ? 1 : -1;
-	int	len = strlen(str);
+	char **hp;
+	int maxhist = histptr - history;
+	int incr = fwd ? 1 : -1;
+	size_t len = strlen(str);
 
 	if (start < 0 || start >= maxhist)
 		start = maxhist;
@@ -492,43 +528,22 @@ findhist(int start, int fwd, const char *str, int anchored)
 	return (-1);
 }
 
-int
-findhistrel(const char *str)
-{
-	int	maxhist = histptr - history;
-	int	start = maxhist - 1;
-	int	rec;
-
-	getn(str, &rec);
-	if (rec == 0)
-		return (-1);
-	if (rec > 0) {
-		if (rec > maxhist)
-			return (-1);
-		return (rec - 1);
-	}
-	if (rec > maxhist)
-		return (-1);
-	return (start + rec + 1);
-}
-
 /*
- *	set history
- *	this means reallocating the dataspace
+ * set history; this means reallocating the dataspace
  */
 void
-sethistsize(int n)
+sethistsize(mksh_ari_t n)
 {
 	if (n > 0 && n != histsize) {
 		int cursize = histptr - history;
 
 		/* save most recent history */
 		if (n < cursize) {
-			memmove(history, histptr - n, n * sizeof(char *));
-			cursize = n;
+			memmove(history, histptr - n + 1, n * sizeof(char *));
+			cursize = n - 1;
 		}
 
-		history = aresize(history, n * sizeof(char *), APERM);
+		history = aresize2(history, n, sizeof(char *), APERM);
 
 		histsize = n;
 		histptr = history + cursize;
@@ -537,15 +552,14 @@ sethistsize(int n)
 
 #if HAVE_PERSISTENT_HISTORY
 /*
- *	set history file
- *	This can mean reloading/resetting/starting history file
- *	maintenance
+ * set history file; this can mean reloading/resetting/starting
+ * history file maintenance
  */
 void
 sethistfile(const char *name)
 {
 	/* if not started then nothing to do */
-	if (hstarted == 0)
+	if (hstarted == false)
 		return;
 
 	/* if the name is the same as the name we have */
@@ -553,13 +567,13 @@ sethistfile(const char *name)
 		return;
 
 	/*
-	 * its a new name - possibly
+	 * it's a new name - possibly
 	 */
-	if (histfd) {
+	if (histfd != -1) {
 		/* yes the file is open */
 		(void)close(histfd);
-		histfd = 0;
-		hsize = 0;
+		histfd = -1;
+		histfsize = 0;
 		afree(hname, APERM);
 		hname = NULL;
 		/* let's reset the history */
@@ -572,25 +586,21 @@ sethistfile(const char *name)
 #endif
 
 /*
- *	initialise the history vector
+ * initialise the history vector
  */
 void
 init_histvec(void)
 {
 	if (history == (char **)NULL) {
-		histsize = HISTORYSIZE;
-		history = alloc(histsize * sizeof(char *), APERM);
+		histsize = MKSH_DEFHISTSIZE;
+		history = alloc2(histsize, sizeof(char *), APERM);
 		histptr = history - 1;
 	}
 }
 
 
 /*
- *	Routines added by Peter Collinson BSDI(Europe)/Hillside Systems to
- *	a) permit HISTSIZE to control number of lines of history stored
- *	b) maintain a physical history file
- *
- *	It turns out that there is a lot of ghastly hackery here
+ * It turns out that there is a lot of ghastly hackery here
  */
 
 #if !defined(MKSH_SMALL) && HAVE_PERSISTENT_HISTORY
@@ -600,7 +610,7 @@ histsync(void)
 {
 	bool changed = false;
 
-	if (histfd) {
+	if (histfd != -1) {
 		int lno = hist_source->line;
 
 		hist_source->line++;
@@ -639,13 +649,14 @@ histsave(int *lnp, const char *cmd, bool dowrite MKSH_A_UNUSED, bool ignoredups)
 	++*lnp;
 
 #if HAVE_PERSISTENT_HISTORY
-	if (histfd && dowrite)
+	if (dowrite && histfd != -1)
 		writehistfile(*lnp, c);
 #endif
 
 	hp = histptr;
 
-	if (++hp >= history + histsize) { /* remove oldest command */
+	if (++hp >= history + histsize) {
+		/* remove oldest command */
 		afree(*history, APERM);
 		for (hp = history; hp < history + histsize - 1; hp++)
 			hp[0] = hp[1];
@@ -655,382 +666,287 @@ histsave(int *lnp, const char *cmd, bool dowrite MKSH_A_UNUSED, bool ignoredups)
 }
 
 /*
- *	Write history data to a file nominated by HISTFILE
- *	if HISTFILE is unset then history still happens, but
- *	the data is not written to a file
- *	All copies of ksh looking at the file will maintain the
- *	same history. This is ksh behaviour.
+ * Write history data to a file nominated by HISTFILE;
+ * if HISTFILE is unset then history still happens, but
+ * the data is not written to a file. All copies of ksh
+ * looking at the file will maintain the same history.
+ * This is ksh behaviour.
  *
- *	This stuff uses mmap()
- *	if your system ain't got it - then you'll have to undef HISTORYFILE
+ * This stuff uses mmap()
+ *
+ * This stuff is so totally broken it must eventually be
+ * redesigned, without mmap, better checks, support for
+ * larger files, etc. and handle partially corrupted files
  */
 
-/*
- *	Open a history file
- *	Format is:
- *	Bytes 1, 2:
- *		HMAGIC - just to check that we are dealing with
- *		the correct object
- *	Then follows a number of stored commands
- *	Each command is
- *	<command byte><command number(4 bytes)><bytes><null>
+/*-
+ * Open a history file
+ * Format is:
+ * Bytes 1, 2:
+ *	HMAGIC - just to check that we are dealing with the correct object
+ * Then follows a number of stored commands
+ * Each command is
+ *	<command byte><command number(4 octets, big endian)><bytes><NUL>
  */
-#define HMAGIC1		0xab
-#define HMAGIC2		0xcd
-#define COMMAND		0xff
+#define HMAGIC1		0xAB
+#define HMAGIC2		0xCD
+#define COMMAND		0xFF
+
+#if HAVE_PERSISTENT_HISTORY
+static const unsigned char sprinkle[2] = { HMAGIC1, HMAGIC2 };
+#endif
 
 void
 hist_init(Source *s)
 {
 #if HAVE_PERSISTENT_HISTORY
 	unsigned char *base;
-	int lines, fd, rv = 0;
+	int lines, fd;
+	enum { hist_init_first, hist_init_retry, hist_init_restore } hs;
 #endif
 
 	if (Flag(FTALKING) == 0)
 		return;
 
-	hstarted = 1;
-
+	hstarted = true;
 	hist_source = s;
 
 #if HAVE_PERSISTENT_HISTORY
 	if ((hname = str_val(global("HISTFILE"))) == NULL)
 		return;
 	strdupx(hname, hname, APERM);
+	hs = hist_init_first;
 
  retry:
 	/* we have a file and are interactive */
-	if ((fd = open(hname, O_RDWR|O_CREAT|O_APPEND, 0600)) < 0)
+	if ((fd = open(hname, O_RDWR | O_CREAT | O_APPEND, 0600)) < 0)
 		return;
 
 	histfd = savefd(fd);
 	if (histfd != fd)
 		close(fd);
 
-	(void)flock(histfd, LOCK_EX);
+	mksh_lockfd(histfd);
 
-	hsize = lseek(histfd, (off_t)0, SEEK_END);
+	histfsize = lseek(histfd, (off_t)0, SEEK_END);
+	if (histfsize > MKSH_MAXHISTFSIZE || hs == hist_init_restore) {
+		/* we ignore too large files but still append to them */
+		/* we also don't need to re-read after truncation */
+		goto hist_init_tail;
+	} else if (histfsize > 2) {
+		/* we have some data, check its validity */
+		base = (void *)mmap(NULL, (size_t)histfsize, PROT_READ,
+		    MAP_FILE | MAP_PRIVATE, histfd, (off_t)0);
+		if (base == (unsigned char *)MAP_FAILED)
+			goto hist_init_fail;
+		if (base[0] != HMAGIC1 || base[1] != HMAGIC2) {
+			munmap(caddr_cast(base), (size_t)histfsize);
+			goto hist_init_fail;
+		}
+		/* load _all_ data */
+		lines = histload(hist_source, base + 2, (size_t)histfsize - 2);
+		munmap(caddr_cast(base), (size_t)histfsize);
+		/* check if the file needs to be truncated */
+		if (lines > histsize && histptr >= history) {
+			/* you're fucked up with the current code, trust me */
+			char *nhname, **hp;
+			struct stat sb;
 
-	if (hsize == 0) {
-		/* add magic */
-		if (sprinkle(histfd)) {
+			/* create temporary file */
+			nhname = shf_smprintf("%s.%d", hname, (int)procpid);
+			if ((fd = open(nhname, O_RDWR | O_CREAT | O_TRUNC |
+			    O_EXCL, 0600)) < 0) {
+				/* just don't truncate then, meh. */
+				goto hist_trunc_dont;
+			}
+			if (fstat(histfd, &sb) >= 0 &&
+			    chown(nhname, sb.st_uid, sb.st_gid)) {
+				/* abort the truncation then, meh. */
+				goto hist_trunc_abort;
+			}
+			/* we definitively want some magic in that file */
+			if (write(fd, sprinkle, 2) != 2)
+				goto hist_trunc_abort;
+			/* and of course the entries */
+			hp = history;
+			while (hp < histptr) {
+				if (!writehistline(fd,
+				    s->line - (histptr - hp), *hp))
+					goto hist_trunc_abort;
+				++hp;
+			}
+			/* now unlock, close both, rename, rinse, repeat */
+			close(fd);
+			fd = -1;
+			hist_finish();
+			if (rename(nhname, hname) < 0) {
+ hist_trunc_abort:
+				if (fd != -1)
+					close(fd);
+				unlink(nhname);
+				if (fd != -1)
+					goto hist_trunc_dont;
+				/* darn! restore histfd and pray */
+			}
+			hs = hist_init_restore;
+ hist_trunc_dont:
+			afree(nhname, ATEMP);
+			if (hs == hist_init_restore)
+				goto retry;
+		}
+	} else if (histfsize != 0) {
+		/* negative or too small... */
+ hist_init_fail:
+		/* ... or mmap failed or illegal */
+		hist_finish();
+		/* nuke the bogus file then retry, at most once */
+		if (!unlink(hname) && hs != hist_init_retry) {
+			hs = hist_init_retry;
+			goto retry;
+		}
+		if (hs != hist_init_retry)
+			bi_errorf("can't %s %s: %s",
+			    "unlink HISTFILE", hname, strerror(errno));
+		histfsize = 0;
+		return;
+	} else {
+		/* size 0, add magic to the history file */
+		if (write(histfd, sprinkle, 2) != 2) {
 			hist_finish();
 			return;
 		}
-	} else if (hsize > 0) {
-		/*
-		 * we have some data
-		 */
-		base = (void *)mmap(NULL, hsize, PROT_READ,
-		    MAP_FILE | MAP_PRIVATE, histfd, (off_t)0);
-		/*
-		 * check on its validity
-		 */
-		if (base == (unsigned char *)MAP_FAILED ||
-		    *base != HMAGIC1 || base[1] != HMAGIC2) {
-			if (base != (unsigned char *)MAP_FAILED)
-				munmap((caddr_t)base, hsize);
-			hist_finish();
-			if (unlink(hname) /* fails */)
-				goto hiniterr;
-			goto retry;
-		}
-		if (hsize > 2) {
-			lines = hist_count_lines(base+2, hsize-2);
-			if (lines > histsize) {
-				/* we need to make the file smaller */
-				if (hist_shrink(base, hsize))
-					rv = unlink(hname);
-				munmap((caddr_t)base, hsize);
-				hist_finish();
-				if (rv) {
- hiniterr:
-					bi_errorf("cannot unlink HISTFILE %s"
-					    " - %s", hname, strerror(errno));
-					hsize = 0;
-					return;
-				}
-				goto retry;
-			}
-		}
-		histload(hist_source, base+2, hsize-2);
-		munmap((caddr_t)base, hsize);
 	}
-	(void)flock(histfd, LOCK_UN);
-	hsize = lseek(histfd, (off_t)0, SEEK_END);
+	histfsize = lseek(histfd, (off_t)0, SEEK_END);
+ hist_init_tail:
+	mksh_unlkfd(histfd);
 #endif
 }
 
 #if HAVE_PERSISTENT_HISTORY
-typedef enum state {
-	shdr,		/* expecting a header */
-	sline,		/* looking for a null byte to end the line */
-	sn1,		/* bytes 1 to 4 of a line no */
-	sn2, sn3, sn4
-} State;
-
-static int
-hist_count_lines(unsigned char *base, int bytes)
-{
-	State state = shdr;
-	int lines = 0;
-
-	while (bytes--) {
-		switch (state) {
-		case shdr:
-			if (*base == COMMAND)
-				state = sn1;
-			break;
-		case sn1:
-			state = sn2; break;
-		case sn2:
-			state = sn3; break;
-		case sn3:
-			state = sn4; break;
-		case sn4:
-			state = sline; break;
-		case sline:
-			if (*base == '\0') {
-				lines++;
-				state = shdr;
-			}
-		}
-		base++;
-	}
-	return (lines);
-}
-
 /*
- *	Shrink the history file to histsize lines
+ * load the history structure from the stored data
  */
 static int
-hist_shrink(unsigned char *oldbase, int oldbytes)
+histload(Source *s, unsigned char *base, size_t bytes)
 {
-	int fd, rv = 0;
-	char *nfile = NULL;
-	struct	stat statb;
-	unsigned char *nbase = oldbase;
-	int nbytes = oldbytes;
+	int lno = 0, lines = 0;
+	unsigned char *cp;
 
-	nbase = hist_skip_back(nbase, &nbytes, histsize);
-	if (nbase == NULL)
-		return (1);
-	if (nbase == oldbase)
-		return (0);
+ histload_loop:
+	/* !bytes check as some systems (older FreeBSDs) have buggy memchr */
+	if (!bytes || (cp = memchr(base, COMMAND, bytes)) == NULL)
+		return (lines);
+	/* advance base pointer past COMMAND byte */
+	bytes -= ++cp - base;
+	base = cp;
+	/* if there is no full string left, don't bother with the rest */
+	if (bytes < 5 || (cp = memchr(base + 4, '\0', bytes - 4)) == NULL)
+		return (lines);
+	/* load the stored line number */
+	lno = ((base[0] & 0xFF) << 24) | ((base[1] & 0xFF) << 16) |
+	    ((base[2] & 0xFF) << 8) | (base[3] & 0xFF);
+	/* store away the found line (@base[4]) */
+	++lines;
+	if (histptr >= history && lno - 1 != s->line) {
+		/* a replacement? */
+		char **hp;
 
-	/*
-	 *	create temp file
-	 */
-	nfile = shf_smprintf("%s.%d", hname, (int)procpid);
-	if ((fd = open(nfile, O_CREAT | O_TRUNC | O_WRONLY, 0600)) < 0)
-		goto errout;
-	if (fstat(histfd, &statb) >= 0 &&
-	    chown(nfile, statb.st_uid, statb.st_gid))
-		goto errout;
-
-	if (sprinkle(fd) || write(fd, nbase, nbytes) != nbytes)
-		goto errout;
-	close(fd);
-	fd = -1;
-
-	/*
-	 *	rename
-	 */
-	if (rename(nfile, hname) < 0) {
- errout:
-		if (fd >= 0) {
-			close(fd);
-			if (nfile)
-				unlink(nfile);
+		if (lno >= s->line - (histptr - history) && lno <= s->line) {
+			hp = &histptr[lno - s->line];
+			if (*hp)
+				afree(*hp, APERM);
+			strdupx(*hp, (char *)(base + 4), APERM);
 		}
-		rv = 1;
+	} else {
+		s->line = lno--;
+		histsave(&lno, (char *)(base + 4), false, false);
 	}
-	afree(nfile, ATEMP);
-	return (rv);
+	/* advance base pointer past NUL */
+	bytes -= ++cp - base;
+	base = cp;
+	/* repeat until no more */
+	goto histload_loop;
 }
 
 /*
- *	find a pointer to the data 'no' back from the end of the file
- *	return the pointer and the number of bytes left
- */
-static unsigned char *
-hist_skip_back(unsigned char *base, int *bytes, int no)
-{
-	int lines = 0;
-	unsigned char *ep;
-
-	for (ep = base + *bytes; --ep > base; ) {
-		/*
-		 * this doesn't really work: the 4 byte line number that
-		 * is encoded after the COMMAND byte can itself contain
-		 * the COMMAND byte....
-		 */
-		for (; ep > base && *ep != COMMAND; ep--)
-			;
-		if (ep == base)
-			break;
-		if (++lines == no) {
-			*bytes = *bytes - ((char *)ep - (char *)base);
-			return (ep);
-		}
-	}
-	return (NULL);
-}
-
-/*
- *	load the history structure from the stored data
+ * write a command to the end of the history file
+ *
+ * This *MAY* seem easy but it's also necessary to check
+ * that the history file has not changed in size.
+ * If it has - then some other shell has written to it and
+ * we should (re)read those commands to update our history
  */
 static void
-histload(Source *s, unsigned char *base, int bytes)
+writehistfile(int lno, const char *cmd)
 {
-	State state;
-	int lno = 0;
-	unsigned char *line = NULL;
+	off_t sizenow;
+	size_t bytes;
+	unsigned char *base, *news;
 
-	for (state = shdr; bytes-- > 0; base++) {
-		switch (state) {
-		case shdr:
-			if (*base == COMMAND)
-				state = sn1;
-			break;
-		case sn1:
-			lno = (((*base)&0xff)<<24);
-			state = sn2;
-			break;
-		case sn2:
-			lno |= (((*base)&0xff)<<16);
-			state = sn3;
-			break;
-		case sn3:
-			lno |= (((*base)&0xff)<<8);
-			state = sn4;
-			break;
-		case sn4:
-			lno |= (*base)&0xff;
-			line = base+1;
-			state = sline;
-			break;
-		case sline:
-			if (*base == '\0') {
-				/* worry about line numbers */
-				if (histptr >= history && lno-1 != s->line) {
-					/* a replacement ? */
-					histinsert(s, lno, (char *)line);
-				} else {
-					s->line = lno--;
-					histsave(&lno, (char *)line, false,
-					    false);
-				}
-				state = shdr;
-			}
-		}
-	}
-}
-
-/*
- *	Insert a line into the history at a specified number
- */
-static void
-histinsert(Source *s, int lno, const char *line)
-{
-	char **hp;
-
-	if (lno >= s->line - (histptr - history) && lno <= s->line) {
-		hp = &histptr[lno - s->line];
-		if (*hp)
-			afree(*hp, APERM);
-		strdupx(*hp, line, APERM);
-	}
-}
-
-/*
- *	write a command to the end of the history file
- *	This *MAY* seem easy but it's also necessary to check
- *	that the history file has not changed in size.
- *	If it has - then some other shell has written to it
- *	and we should read those commands to update our history
- */
-static void
-writehistfile(int lno, char *cmd)
-{
-	int	sizenow;
-	unsigned char	*base;
-	unsigned char	*news;
-	int	bytes;
-	unsigned char	hdr[5];
-
-	(void)flock(histfd, LOCK_EX);
+	mksh_lockfd(histfd);
 	sizenow = lseek(histfd, (off_t)0, SEEK_END);
-	if (sizenow != hsize) {
-		/*
-		 *	Things have changed
-		 */
-		if (sizenow > hsize) {
-			/* someone has added some lines */
-			bytes = sizenow - hsize;
-			base = (void *)mmap(NULL, sizenow, PROT_READ,
-			    MAP_FILE | MAP_PRIVATE, histfd, (off_t)0);
-			if (base == (unsigned char *)MAP_FAILED)
-				goto bad;
-			news = base + hsize;
-			if (*news != COMMAND) {
-				munmap((caddr_t)base, sizenow);
-				goto bad;
-			}
+	if (sizenow < histfsize) {
+		/* the file has shrunk; give up */
+		goto bad;
+	}
+	if (
+		/* ignore changes when the file is too large */
+		sizenow <= MKSH_MAXHISTFSIZE
+	    &&
+		/* the size has changed, we need to do read updates */
+		sizenow > histfsize
+	    ) {
+		/* both sizenow and histfsize are <= MKSH_MAXHISTFSIZE */
+		bytes = (size_t)(sizenow - histfsize);
+		base = (void *)mmap(NULL, (size_t)sizenow, PROT_READ,
+		    MAP_FILE | MAP_PRIVATE, histfd, (off_t)0);
+		if (base == (unsigned char *)MAP_FAILED)
+			goto bad;
+		news = base + (size_t)histfsize;
+		if (*news == COMMAND) {
 			hist_source->line--;
 			histload(hist_source, news, bytes);
 			hist_source->line++;
 			lno = hist_source->line;
-			munmap((caddr_t)base, sizenow);
-			hsize = sizenow;
-		} else {
-			/* it has shrunk */
-			/* but to what? */
-			/* we'll give up for now */
+		} else
+			bytes = 0;
+		munmap(caddr_cast(base), (size_t)sizenow);
+		if (!bytes)
 			goto bad;
-		}
 	}
-	if (cmd) {
-		/*
-		 *	we can write our bit now
-		 */
-		hdr[0] = COMMAND;
-		hdr[1] = (lno>>24)&0xff;
-		hdr[2] = (lno>>16)&0xff;
-		hdr[3] = (lno>>8)&0xff;
-		hdr[4] = lno&0xff;
-		bytes = strlen(cmd) + 1;
-		if ((write(histfd, hdr, 5) != 5) ||
-		    (write(histfd, cmd, bytes) != bytes))
-			goto bad;
-		hsize = lseek(histfd, (off_t)0, SEEK_END);
-	}
-	(void)flock(histfd, LOCK_UN);
-	return;
+	if (cmd && !writehistline(histfd, lno, cmd)) {
  bad:
-	hist_finish();
+		hist_finish();
+		return;
+	}
+	histfsize = lseek(histfd, (off_t)0, SEEK_END);
+	mksh_unlkfd(histfd);
+}
+
+static int
+writehistline(int fd, int lno, const char *cmd)
+{
+	ssize_t n;
+	unsigned char hdr[5];
+
+	hdr[0] = COMMAND;
+	hdr[1] = (lno >> 24) & 0xFF;
+	hdr[2] = (lno >> 16) & 0xFF;
+	hdr[3] = (lno >> 8) & 0xFF;
+	hdr[4] = lno & 0xFF;
+	n = strlen(cmd) + 1;
+	return (write(fd, hdr, 5) == 5 && write(fd, cmd, n) == n);
 }
 
 void
 hist_finish(void)
 {
-	(void)flock(histfd, LOCK_UN);
+	mksh_unlkfd(histfd);
 	(void)close(histfd);
-	histfd = 0;
-}
-
-/*
- *	add magic to the history file
- */
-static int
-sprinkle(int fd)
-{
-	static const unsigned char mag[] = { HMAGIC1, HMAGIC2 };
-
-	return (write(fd, mag, 2) != 2);
+	histfd = -1;
 }
 #endif
+
 
 #if !HAVE_SYS_SIGNAME
 static const struct mksh_sigpair {
@@ -1048,10 +964,12 @@ inittraps(void)
 	int i;
 	const char *cs;
 
+	trap_exstat = -1;
+
 	/* Populate sigtraps based on sys_signame and sys_siglist. */
 	for (i = 0; i <= NSIG; i++) {
 		sigtraps[i].signal = i;
-		if (i == SIGERR_) {
+		if (i == ksh_SIGERR) {
 			sigtraps[i].name = "ERR";
 			sigtraps[i].mess = "Error handler";
 		} else {
@@ -1069,8 +987,14 @@ inittraps(void)
 			else {
 				char *s;
 
-				if (!strncasecmp(cs, "SIG", 3))
+				/* this is not optimal, what about SIGSIG1? */
+				if ((cs[0] & 0xDF) == 'S' &&
+				    (cs[1] & 0xDF) == 'I' &&
+				    (cs[2] & 0xDF) == 'G' &&
+				    cs[3] != '\0') {
+					/* skip leading "SIG" */
 					cs += 3;
+				}
 				strdupx(s, cs, APERM);
 				sigtraps[i].name = s;
 				while ((*s = ksh_toupper(*s)))
@@ -1085,10 +1009,12 @@ inittraps(void)
 #endif
 			if ((sigtraps[i].mess == NULL) ||
 			    (sigtraps[i].mess[0] == '\0'))
-				sigtraps[i].mess = shf_smprintf("Signal %d", i);
+				sigtraps[i].mess = shf_smprintf("%s %d",
+				    "Signal", i);
 		}
 	}
-	sigtraps[SIGEXIT_].name = "EXIT";	/* our name for signal 0 */
+	/* our name for signal 0 */
+	sigtraps[ksh_SIGEXIT].name = "EXIT";
 
 	(void)sigemptyset(&Sigact_ign.sa_mask);
 	Sigact_ign.sa_flags = 0; /* interruptible */
@@ -1096,7 +1022,8 @@ inittraps(void)
 
 	sigtraps[SIGINT].flags |= TF_DFL_INTR | TF_TTY_INTR;
 	sigtraps[SIGQUIT].flags |= TF_DFL_INTR | TF_TTY_INTR;
-	sigtraps[SIGTERM].flags |= TF_DFL_INTR;/* not fatal for interactive */
+	/* SIGTERM is not fatal for interactive */
+	sigtraps[SIGTERM].flags |= TF_DFL_INTR;
 	sigtraps[SIGHUP].flags |= TF_FATAL;
 	sigtraps[SIGCHLD].flags |= TF_SHELL_USES;
 
@@ -1135,27 +1062,45 @@ alarm_catcher(int sig MKSH_A_UNUSED)
 }
 
 Trap *
-gettrap(const char *name, int igncase)
+gettrap(const char *cs, bool igncase)
 {
-	int n = NSIG + 1;
+	int i;
 	Trap *p;
-	const char *n2;
-	int (*cmpfunc)(const char *, const char *) = strcmp;
+	char *as;
 
-	if (ksh_isdigit(*name)) {
-		if (getn(name, &n) && 0 <= n && n < NSIG)
-			return (&sigtraps[n]);
-		else
-			return (NULL);
+	if (ksh_isdigit(*cs)) {
+		return ((getn(cs, &i) && 0 <= i && i < NSIG) ?
+		    (&sigtraps[i]) : NULL);
 	}
 
-	n2 = strncasecmp(name, "SIG", 3) ? NULL : name + 3;
-	if (igncase)
-		cmpfunc = strcasecmp;
-	for (p = sigtraps; --n >= 0; p++)
-		if (!cmpfunc(p->name, name) || (n2 && !cmpfunc(p->name, n2)))
-			return (p);
-	return (NULL);
+	/* this breaks SIGSIG1, but we do that above anyway */
+	if ((cs[0] & 0xDF) == 'S' &&
+	    (cs[1] & 0xDF) == 'I' &&
+	    (cs[2] & 0xDF) == 'G' &&
+	    cs[3] != '\0') {
+		/* skip leading "SIG" */
+		cs += 3;
+	}
+	if (igncase) {
+		char *s;
+
+		strdupx(as, cs, ATEMP);
+		cs = s = as;
+		while ((*s = ksh_toupper(*s)))
+			++s;
+	} else
+		as = NULL;
+
+	p = sigtraps;
+	for (i = 0; i <= NSIG; i++) {
+		if (!strcmp(p->name, cs))
+			goto found;
+		++p;
+	}
+	p = NULL;
+ found:
+	afree(as, ATEMP);
+	return (p);
 }
 
 /*
@@ -1165,7 +1110,7 @@ void
 trapsig(int i)
 {
 	Trap *p = &sigtraps[i];
-	int errno_ = errno;
+	int errno_sv = errno;
 
 	trap = p->set = 1;
 	if (p->flags & TF_DFL_INTR)
@@ -1176,7 +1121,7 @@ trapsig(int i)
 	}
 	if (p->shtrap)
 		(*p->shtrap)(i);
-	errno = errno_;
+	errno = errno_sv;
 }
 
 /*
@@ -1252,22 +1197,29 @@ runtraps(int flag)
 		intrsig = 0;
 	if (flag & TF_FATAL)
 		fatal_trap = 0;
+	++trap_nested;
 	for (p = sigtraps, i = NSIG+1; --i >= 0; p++)
 		if (p->set && (!flag ||
 		    ((p->flags & flag) && p->trap == NULL)))
-			runtrap(p);
+			runtrap(p, false);
+	if (!--trap_nested)
+		runtrap(NULL, true);
 }
 
 void
-runtrap(Trap *p)
+runtrap(Trap *p, bool is_last)
 {
-	int	i = p->signal;
-	char	*trapstr = p->trap;
-	int	oexstat;
-	int	old_changed = 0;
+	int old_changed = 0, i;
+	char *trapstr;
 
+	if (p == NULL)
+		/* just clean up, see runtraps() above */
+		goto donetrap;
+	i = p->signal;
+	trapstr = p->trap;
 	p->set = 0;
-	if (trapstr == NULL) { /* SIG_DFL */
+	if (trapstr == NULL) {
+		/* SIG_DFL */
 		if (p->flags & TF_FATAL) {
 			/* eg, SIGHUP */
 			exstat = 128 + i;
@@ -1278,29 +1230,38 @@ runtrap(Trap *p)
 			exstat = 128 + i;
 			unwind(LINTR);
 		}
-		return;
+		goto donetrap;
 	}
-	if (trapstr[0] == '\0') /* SIG_IGN */
-		return;
-	if (i == SIGEXIT_ || i == SIGERR_) {	/* avoid recursion on these */
+	if (trapstr[0] == '\0')
+		/* SIG_IGN */
+		goto donetrap;
+	if (i == ksh_SIGEXIT || i == ksh_SIGERR) {
+		/* avoid recursion on these */
 		old_changed = p->flags & TF_CHANGED;
 		p->flags &= ~TF_CHANGED;
 		p->trap = NULL;
 	}
-	oexstat = exstat;
+	if (trap_exstat == -1)
+		trap_exstat = exstat;
 	/*
 	 * Note: trapstr is fully parsed before anything is executed, thus
 	 * no problem with afree(p->trap) in settrap() while still in use.
 	 */
 	command(trapstr, current_lineno);
-	exstat = oexstat;
-	if (i == SIGEXIT_ || i == SIGERR_) {
+	if (i == ksh_SIGEXIT || i == ksh_SIGERR) {
 		if (p->flags & TF_CHANGED)
 			/* don't clear TF_CHANGED */
 			afree(trapstr, APERM);
 		else
 			p->trap = trapstr;
 		p->flags |= old_changed;
+	}
+
+ donetrap:
+	/* we're the last trap of a sequence executed */
+	if (is_last && trap_exstat != -1) {
+		exstat = trap_exstat;
+		trap_exstat = -1;
 	}
 }
 
@@ -1341,7 +1302,8 @@ settrap(Trap *p, const char *s)
 
 	if (p->trap)
 		afree(p->trap, APERM);
-	strdupx(p->trap, s, APERM); /* handles s == 0 */
+	/* handles s == NULL */
+	strdupx(p->trap, s, APERM);
 	p->flags |= TF_CHANGED;
 	f = !s ? SIG_DFL : s[0] ? trapsig : SIG_IGN;
 
@@ -1385,7 +1347,8 @@ block_pipe(void)
 			restore_dfl = 1;
 	} else if (p->cursig == SIG_DFL) {
 		setsig(p, SIG_IGN, SS_RESTORE_CURR);
-		restore_dfl = 1; /* restore to SIG_DFL */
+		/* restore to SIG_DFL */
+		restore_dfl = 1;
 	}
 	return (restore_dfl);
 }
@@ -1407,7 +1370,7 @@ setsig(Trap *p, sig_t f, int flags)
 {
 	struct sigaction sigact;
 
-	if (p->signal == SIGEXIT_ || p->signal == SIGERR_)
+	if (p->signal == ksh_SIGEXIT || p->signal == ksh_SIGERR)
 		return (1);
 
 	/*
@@ -1448,7 +1411,8 @@ setsig(Trap *p, sig_t f, int flags)
 	if (p->cursig != f) {
 		p->cursig = f;
 		(void)sigemptyset(&sigact.sa_mask);
-		sigact.sa_flags = 0 /* interruptible */;
+		/* interruptible */
+		sigact.sa_flags = 0;
 		sigact.sa_handler = f;
 		sigaction(p->signal, &sigact, NULL);
 	}
@@ -1468,7 +1432,8 @@ setexecsig(Trap *p, int restore)
 	/* restore original value for exec'd kids */
 	p->flags &= ~(TF_EXEC_IGN|TF_EXEC_DFL);
 	switch (restore & SS_RESTORE_MASK) {
-	case SS_RESTORE_CURR: /* leave things as they currently are */
+	case SS_RESTORE_CURR:
+		/* leave things as they currently are */
 		break;
 	case SS_RESTORE_ORIG:
 		p->flags |= p->flags & TF_ORIG_IGN ? TF_EXEC_IGN : TF_EXEC_DFL;
@@ -1481,3 +1446,56 @@ setexecsig(Trap *p, int restore)
 		break;
 	}
 }
+
+#if HAVE_PERSISTENT_HISTORY || defined(DF)
+/*
+ * File descriptor locking and unlocking functions.
+ * Could use some error handling, but hey, this is only
+ * advisory locking anyway, will often not work over NFS,
+ * and you are SOL if this fails...
+ */
+
+void
+mksh_lockfd(int fd)
+{
+#if defined(__OpenBSD__)
+	/* flock is not interrupted by signals */
+	(void)flock(fd, LOCK_EX);
+#elif HAVE_FLOCK
+	int rv;
+
+	/* e.g. on Linux */
+	do {
+		rv = flock(fd, LOCK_EX);
+	} while (rv == 1 && errno == EINTR);
+#elif HAVE_LOCK_FCNTL
+	int rv;
+	struct flock lks;
+
+	memset(&lks, 0, sizeof(lks));
+	lks.l_type = F_WRLCK;
+	do {
+		rv = fcntl(fd, F_SETLKW, &lks);
+	} while (rv == 1 && errno == EINTR);
+#endif
+}
+
+/* designed to not define mksh_unlkfd if none triggered */
+#if HAVE_FLOCK
+void
+mksh_unlkfd(int fd)
+{
+	(void)flock(fd, LOCK_UN);
+}
+#elif HAVE_LOCK_FCNTL
+void
+mksh_unlkfd(int fd)
+{
+	struct flock lks;
+
+	memset(&lks, 0, sizeof(lks));
+	lks.l_type = F_UNLCK;
+	(void)fcntl(fd, F_SETLKW, &lks);
+}
+#endif
+#endif
